@@ -23,6 +23,22 @@ Bu proje, şifreyi bilgisayarınızın herhangi bir yerinde açıkça tutmak yer
 
 ---
 
+## 🌍 Mobil Veri & Uzaktan Erişim (Tailscale)
+Eğer dışarıdayken (Mobil Veri) bilgisayarınıza onay göndermek isterseniz, güvenlik sebebiyle modeminizden Port Açmak (Port Forwarding) **kesinlikle önerilmez**. Bunun yerine **Tailscale (VPN)** kullanmalısınız.
+- PC ve telefonunuza Tailscale kurun.
+- Macrodroid'deki URL'ye, PC'nizin `192.168...` olan yerel IP'si yerine, Tailscale IP'sini (`100.x.x.x`) yazın. 
+- **Sonuç:** Tünel sayesinde dünyanın neresinde olursanız olun PC'nize güvenli onay yollayabilirsiniz.
+
+## 🛑 Özel DNS (Reklam Engelleyici) ve VPN Çakışmasını Çözme
+Android sistemler aynı anda birden fazla VPN/Özel DNS çalışmasına izin vermez. Tailscale'i açtığınızda AdGuard gibi reklam engelleyicileriniz devre dışı kalabilir. 
+**Çözüm (Tailscale İçine DNS Gömmek):**
+1. `login.tailscale.com` adresine girin ve **DNS** sekmesini açın.
+2. **Nameservers -> Custom Nameserver** kısmına Reklam Engelleyici IP'nizi girin (Örn. AdGuard: `94.140.14.14`).
+3. Eklediğiniz IP'nin yanındaki **"Override local DNS"** butonunu aktif edin.
+*Bu sayede Tailscale bağlıyken hem telefonunuzdaki tüm reklamlar engellenir, hem de PC'nizle olan gizli JIT bağlantınız kesintisiz çalışır.*
+
+---
+
 ## 🛠️ Kurulum Rehberi
 
 ### 1. Windows Tarafı (DPAPI Kurulumu)
@@ -38,14 +54,12 @@ Telefonunuzu bir güvenlik cihazına dönüştürüyoruz:
 3. **Tetikleyici (Trigger):** `Webhook (URL)` seçin. Ekranda size verilen `https://trigger.macrodroid.com/YOUR_UUID/...` şeklindeki linki kopyalayın.
 4. **Eylemler (Actions):** 
    - Öncelikle bir **Onay İletişim Kutusu (Confirmation Dialog)** ekleyin (Başlık: "Ajan Onay İstiyor").
-   - Ardından bir **HTTP İsteği (HTTP Request)** ekleyin. Yöntem: `GET`, URL: `http://PC_YEREL_IP_ADRESINIZ:5050/approve` (Örn: 192.168.1.x:5050).
-5. Makroyu kaydedin.
+   - Ardından bir **HTTP İsteği (HTTP Request)** ekleyin. Yöntem: `GET`, URL: `http://100.x.x.x:5050/approve?token=GIZLI_SIFRENIZ`
 
 ### 3. Sunucuyu Ayarlama
-`jit_server.py` dosyasını bir metin editörü ile açın ve şu kısmı az önce Macrodroid'den aldığınız link ile değiştirin:
-```python
-MACRODROID_WEBHOOK = "https://trigger.macrodroid.com/BURAYA_KENDI_LINKINIZ_GELECEK"
-```
+`jit_server.py` dosyasını bir metin editörü ile açın:
+- `MACRODROID_WEBHOOK` kısmına telefondaki linkinizi yazın.
+- `SECRET_TOKEN` kısmına (Spoofing koruması için) URL'nin sonuna eklediğiniz şifreyi (Örn: `GIZLI_SIFRENIZ`) yazın.
 
 ## 🎮 Kullanım / Test Etme
 Terminalinizi açın ve sunucuyu başlatın:
