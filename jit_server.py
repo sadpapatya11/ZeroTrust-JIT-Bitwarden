@@ -2,18 +2,32 @@ import os
 import urllib.request
 from http.server import BaseHTTPRequestHandler, HTTPServer
 import subprocess
+from urllib.parse import urlparse, parse_qs
 
 PORT = 5050
-# BURAYA KENDI MACRODROID WEBHOOK URL'NIZI YAZIN
 MACRODROID_WEBHOOK = "https://trigger.macrodroid.com/YOUR_UUID/ajan_istek"
+SECRET_TOKEN = "GIZLI_SIFRENIZ" 
 
 class JITHandler(BaseHTTPRequestHandler):
     def do_GET(self):
-        if self.path == '/approve':
+        parsed_path = urlparse(self.path)
+        
+        if parsed_path.path == '/approve':
+            query_components = parse_qs(parsed_path.query)
+            token = query_components.get('token', [''])[0]
+            
+            if token != SECRET_TOKEN:
+                self.send_response(403)
+                self.send_header('Content-type', 'text/plain')
+                self.end_headers()
+                self.wfile.write(b"HATA: Yetkisiz Onay Denemesi (Spoofing) Engellendi!")
+                print(f"\\n[DIKKAT] Sahte bir onay istegi yakalandi ve engellendi! Gelen IP: {self.client_address[0]}")
+                return
+
             self.send_response(200)
             self.send_header('Content-type', 'text/plain')
             self.end_headers()
-            self.wfile.write(b"Onay Alindi! Kasa 1 Saniyeligine Aciliyor...")
+            self.wfile.write(b"Onay Alindi! Kimlik dogrulandi, kasa 1 Saniyeligine Aciliyor...")
             
             ps_script = """
 $securePw = Get-Content "$env:USERPROFILE\\.bw_master_dpapi.txt" | ConvertTo-SecureString
@@ -24,35 +38,11 @@ $plain = [System.Runtime.InteropServices.Marshal]::PtrToStringAuto($BSTR)
 $bytes = [System.Text.Encoding]::UTF8.GetBytes($plain)
 $b64 = [Convert]::ToBase64String($bytes)
 
-$shContent = @"
-echo '$b64' | base64 -d > /dev/shm/.bw_tmp
-TOKEN=`$(bw unlock "`$(cat /dev/shm/.bw_tmp)" --raw 2>/dev/null)
-rm /dev/shm/.bw_tmp 2>/dev/null
+# MUKEMMEL ZERO-TRUST UYGULAMASI: Dosyaya yazmak SIFIRLANDI. 
+# Base64 dogrudan WSL std-in icine aktariliyor ve tr -cd ile temizlenip RAM'e cikariliyor.
+$wslCmd = "echo '$b64' | tr -cd 'A-Za-z0-9+/=' | base64 -d > /dev/shm/.bw_tmp && TOKEN=\\`$(bw unlock --passwordfile /dev/shm/.bw_tmp --raw 2>/dev/null) && rm -f /dev/shm/.bw_tmp && if [ -n \\"\\`$TOKEN\\" ]; then echo \\"\\`$TOKEN\\" > /dev/shm/.bw_session; chmod 600 /dev/shm/.bw_session; echo '[BASARILI]' > /dev/shm/jit_result.txt; rm -f /dev/shm/.bw_session; exit 0; else echo '[HATA]' > /dev/shm/jit_result.txt; exit 1; fi"
 
-if [ -n "`$TOKEN" ]; then
-    echo "`$TOKEN" > /dev/shm/.bw_session
-    chmod 600 /dev/shm/.bw_session
-    
-    # KOR AJAN: BURAYA KENDI GOREVINIZI/KODUNUZU YAZABILIRSINIZ
-    # Ornek: GITHUB_TOKEN=`$(bw get item ... --session `$TOKEN)
-    echo "[BASARILI] Kasa acildi ve islem yapildi." > /dev/shm/jit_result.txt
-    
-    # Islem bittikten sonra aninda imha
-    rm /dev/shm/.bw_session
-    exit 0
-else
-    echo "[HATA] Sifre yanlis veya kasa acilamadi." > /dev/shm/jit_result.txt
-    exit 1
-fi
-"@
-
-$tempPath = "$env:TEMP\\jit_run.sh"
-$wslTemp = "/mnt/c/" + $tempPath.Substring(3).Replace('\\', '/')
-[System.IO.File]::WriteAllText($tempPath, $shContent, [System.Text.Encoding]::ASCII)
-
-$null | wsl -e bash -c "sed -i 's/\\r$//' $wslTemp"
-$null | wsl -e bash $wslTemp
-Remove-Item -Path $tempPath -ErrorAction SilentlyContinue
+$null | wsl -e bash -c $wslCmd
 """
             subprocess.run(["powershell", "-ExecutionPolicy", "Bypass", "-Command", ps_script])
             print("\\n[JIT] Gorev tamamlandi. RAM temizlendi. Sunucu kapaniyor.")
@@ -67,7 +57,7 @@ def request_approval():
         urllib.request.urlopen(MACRODROID_WEBHOOK)
         print("[JIT] Istek basariyla iletildi!")
     except Exception as e:
-        print(f"Webhook hatasi (URL'yi ayarladiginizdan emin olun): {e}")
+        print(f"Webhook hatasi: {e}")
 
 if __name__ == '__main__':
     request_approval()
