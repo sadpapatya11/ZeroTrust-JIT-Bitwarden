@@ -1,0 +1,12 @@
+__pycache__/
+*.py[cod]
+*$py.class
+.env
+.env.*
+.vscode/
+.idea/
+*.log
+*.key
+*.pem
+*.dpapi
+*dpapi*.txt
