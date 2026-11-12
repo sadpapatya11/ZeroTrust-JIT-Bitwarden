@@ -1,4 +1,4 @@
-# 🛡️ Ajan Güvenlik Protokolü (Agent Security Protocol - V2)
+﻿# 🛡️ Ajan Güvenlik Protokolü (Agent Security Protocol - V3)
 
 Bu belgedeki kurallar, otonom yapay zeka ajanlarının ve otomasyon süreçlerinin işletim sistemi ve API servisleriyle etkileşime girerken uyması zorunlu güvenlik manifestosudur.
 

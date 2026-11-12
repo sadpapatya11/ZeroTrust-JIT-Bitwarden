@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
 Zero-Trust JIT Bitwarden Server - Version 2.0 (High Security)
@@ -446,7 +446,7 @@ def run_daemon():
     server_address = ('0.0.0.0', PORT)
     httpd = HardenedHTTPServer(server_address, JITServerHandler)
     print("=" * 65)
-    print(f"  Zero-Trust JIT Bitwarden Daemon V2.0 Aktif")
+    print(f"  Zero-Trust JIT Bitwarden Daemon V3.0 Aktif")
     print(f"  Dinleme Portu        : {PORT}")
     print(f"  OTP Geçerlilik Süresi: {OTP_VALIDITY_SECONDS} Saniye")
     print(f"  Watchdog Zaman Aşımı : {WATCHDOG_TIMEOUT_SECONDS} Saniye (Zorunlu Trap Lock)")

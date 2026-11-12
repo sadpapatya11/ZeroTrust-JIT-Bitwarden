@@ -1,4 +1,4 @@
-# 🛡️ ZeroTrust-JIT-Bitwarden: AI Ajanları İçin Donanım Korumalı, Mobil Onaylı ve Sıfır İzsiz (Zero-Trace) JIT Parola Yönetim Mimarisi
+﻿# 🛡️ ZeroTrust-JIT-Bitwarden: AI Ajanları İçin Donanım Korumalı, Mobil Onaylı ve Sıfır İzsiz (Zero-Trace) JIT Parola Yönetim Mimarisi
 
 [![Python 3.10+](https://img.shields.io/badge/Python-3.10%2B-blue.svg?logo=python&logoColor=white)](https://python.org)
 [![Security Architecture](https://img.shields.io/badge/Security-Zero--Trust%20%7C%20JIT%20%7C%20Pure%20In--Memory-brightgreen.svg)](#-mimari-isleyis-ve-savunma-katmanlari)
@@ -26,7 +26,7 @@ Yapay zeka ajanı veya otomasyon betiği hiçbir zaman ana master parolayı bilm
 
 ## 📊 Karşılaştırmalı Güvenlik ve Risk Matrisi
 
-| Güvenlik Parametresi | Plaintext `.env` / Dosya | Açık Kalan Bitwarden CLI | Geleneksel Secret Manager | **ZeroTrust-JIT-Bitwarden (V2.0)** |
+| Güvenlik Parametresi | Plaintext `.env` / Dosya | Açık Kalan Bitwarden CLI | Geleneksel Secret Manager | **ZeroTrust-JIT-Bitwarden (V3.0)** |
 | :--- | :---: | :---: | :---: | :---: |
 | **Prompt Injection Direnci** | ❌ **SIFIR** (İlk hamlede ifşa) | ⚠️ **ZAYIF** (Ajan kasadan okuyabilir) | ⚠️ **ORTA** (Yetki tokenı çalınabilir) | ✅ **TAM BAĞIŞIK** (Fiziksel onay şartı) |
 | **Disk İzi (Zero-File)** | ❌ Diskte kalıcı | ⚠️ Geçici dosya/oturum açabilir | ❌ Konfigürasyon disktedir | ✅ **SIFIR İZ (Pure In-Memory)** |
@@ -222,14 +222,14 @@ Sistemde görev yapan otonom ajanlar, kök dizinde yer alan [`AGENT_SECURITY_PRO
 
 ```markdown
 ═══════════════════════════════════════════════════════════════════════════════
-        ZERO-TRUST JIT BITWARDEN V2.0 - MASTER BLUEPRINT PROMPT
+        ZERO-TRUST JIT BITWARDEN V3.0 - MASTER BLUEPRINT PROMPT
 ═══════════════════════════════════════════════════════════════════════════════
 [ROL VE HEDEF]
 Sen kıdemli bir Siber Güvenlik Mimarı ve Sistem Yazılım Mühendisisin. 
 Görevin: Yapay zeka ajanlarının ve otomasyon süreçlerinin parola yönetim sistemlerine 
 (Bitwarden) "Sıfır Güven (Zero-Trust)", "Tam Zamanında (Just-In-Time - JIT)" ve 
 "Kör Yürütme (Blind Execution)" ilkeleriyle erişmesini sağlayan 
-"ZeroTrust-JIT-Bitwarden V2.0" mimarisini sıfırdan eksiksiz olarak inşa etmektir.
+"ZeroTrust-JIT-Bitwarden V3.0" mimarisini sıfırdan eksiksiz olarak inşa etmektir.
 
 [KATI MİMARİ VE GÜVENLİK STANDARTLARI]
 1. ZERO-FILE & PURE IN-MEMORY:
