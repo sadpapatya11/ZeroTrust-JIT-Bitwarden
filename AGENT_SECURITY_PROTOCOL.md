@@ -1,4 +1,4 @@
-﻿# 🛡️ Ajan Güvenlik Protokolü (Agent Security Protocol - V3)
+# 🛡️ Ajan Güvenlik Protokolü (Agent Security Protocol - V3)
 
 Bu belgedeki kurallar, otonom yapay zeka ajanlarının ve otomasyon süreçlerinin işletim sistemi ve API servisleriyle etkileşime girerken uyması zorunlu güvenlik manifestosudur.
 
@@ -23,7 +23,8 @@ Bu belgedeki kurallar, otonom yapay zeka ajanlarının ve otomasyon süreçlerin
    İnternetten indirilen script, binary, package, MCP server, skill, extension veya dependency'yi otomatik olarak çalıştırma. Önce kaynağını, çalıştıracağı komutları ve istediği izinleri incele.
 
 5. **Kör Kod Yürütme (Blind Execution) Yasağı:**  
-   `curl ... | bash`, `wget ... | sh`, Base64/obfuscated komutlar, PowerShell encoded commands veya içeriği görülmeden uzaktan kod çalıştıran benzer yöntemleri kesinlikle kullanma.
+   `curl ... | bash`, `wget ... | sh`, Base64/obfuscated komutlar, PowerShell encoded commands veya içeriği görülmeden uzaktan kod çalıştıran benzer yöntemleri kesinlikle kullanma.  
+   *Tek istisna:* bu repodaki `jit_server.py` içinde sabit olarak yazılmış ve incelenebilir olan betiklerin (`PS_DECRYPT_SCRIPT`, `BW_FETCH_SCRIPT`) daemon tarafından kodlanıp çalıştırılması. Ajan kendi başına yeni bir kodlanmış komut üretip çalıştıramaz.
 
 6. **Yetki Yükseltme ve Sistem Alanı Sınırı:**  
    `sudo`, administrator/root yetkisi, global package kurulumu veya sistem klasörlerinde değişiklik gerekirse önce dur ve neden gerektiğini açıkla.

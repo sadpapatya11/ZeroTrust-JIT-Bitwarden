@@ -1,159 +1,300 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Zero-Trust JIT Bitwarden Server - Version 2.0 (High Security)
--------------------------------------------------------------
-Mimari Özellikler:
-1. Pure In-Memory & Zero-File: /dev/shm ve geçici disk dosyaları tamamen kaldırıldı.
-2. Direct Stdin Pipe: Parola doğrudan bellek içi stdin kanalı üzerinden aktarılır.
-3. Subshell Trap Lock: trap 'bw lock >/dev/null 2>&1' EXIT INT TERM ile anında imha.
-4. 30s Dinamik OTP: secrets.token_urlsafe(16) ve hmac.compare_digest ile tek kullanımlık doğrulama.
-5. 30s Zorunlu Watchdog: İşlem takılsa dahi 30 saniye içinde kilitlenir.
-6. Kalıcı Threaded Daemon: os._exit(0) kaldırıldı, 7/24 arka planda nöbetçi servis.
-7. Process Caller Whitelist / PID Denetimi: Yerel isteklerde çağrıyı yapan sürecin PID ve adı doğrulanır.
+Zero-Trust JIT Bitwarden Server - Version 3.0
+---------------------------------------------
+Akış:
+1. Ajan (yerel süreç) /request_approval?item=<ad> ile tek bir sır ister.
+   Sadece JIT_ALLOWED_ITEMS listesindeki kayıtlar istenebilir.
+2. Daemon 30 sn geçerli tek kullanımlık bir OTP üretir ve telefona (MacroDroid) yollar.
+   Telefonda görünen "çağıran süreç" bilgisi ajanın beyanı değil, daemon'un
+   doğruladığı süreç adıdır.
+3. Kullanıcı telefondan onaylayınca /approve?token=<OTP> çağrılır (yalnızca Tailscale IP'lerinden).
+4. Daemon DPAPI ile master parolayı çözer, TEK bir WSL bash çağrısı içinde
+   bw unlock -> bw get -> bw lock yapar (bash trap ile garantili kilit).
+   Session key WSL dışına hiç çıkmaz.
+5. Ajan /fetch?id=<request_id> ile sırrı TEK SEFER alır (30 sn içinde, bellekten).
+
+Disk izi yok: parola/sır dosyaya yazılmaz, komut satırına konmaz, loglanmaz.
+Sınırlar için README'deki "Tehdit modeli" bölümüne bakın.
 """
 
-import os
-import sys
-import time
-import secrets
-import hmac
-import threading
-import subprocess
-import base64
-import urllib.request
-import urllib.parse
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import urlparse, parse_qs
+from __future__ import annotations
 
-# İsteğe bağlı psutil desteği (süreç doğrulama için)
+import base64
+import hmac
+import ipaddress
+import json
+import os
+import re
+import secrets
+import subprocess
+import sys
+import threading
+import time
+import urllib.parse
+import urllib.request
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import parse_qs, urlparse
+
+# Süreç doğrulaması için gerekli (yoksa yerel rotalar Fail-Secure reddedilir)
 try:
     import psutil
 except ImportError:
     psutil = None
 
-PORT = 5050
+VERSION = "3.0"
+PORT = int(os.environ.get("JIT_PORT", "5050"))
+# Varsayılan: sadece loopback. Telefonun erişmesi için Tailscale IP'sini ekleyin:
+#   JIT_BIND=127.0.0.1,100.x.y.z
+BIND_ADDRS = [a.strip() for a in os.environ.get("JIT_BIND", "127.0.0.1").split(",") if a.strip()]
+OTP_VALIDITY_SECONDS = 30
+RESULT_TTL_SECONDS = 30
+WATCHDOG_TIMEOUT_SECONDS = 30
+MAX_NOTE_LENGTH = 80
+
+WEBHOOK_PLACEHOLDER = "https://trigger.macrodroid.com/YOUR_MACRODROID_DEVICE_ID/ajan_istek"
+
+# Windows tarafında yerel çağrıcı olarak kabul edilen süreçler.
+# UYARI: Bu liste ajanı durdurmaz (ajanlar da python/powershell kullanır). Gerçek ayrım için
+# README'deki "ajanı ayrı Windows kullanıcısında / container'da çalıştır" önerisine bakın.
+ALLOWED_PROCESS_NAMES = {
+    "python.exe", "python3.exe", "pythonw.exe", "powershell.exe", "pwsh.exe",
+    "cmd.exe", "wsl.exe", "bash.exe", "conhost.exe", "curl.exe",
+}
+
+# Uzak onay yalnızca Tailscale adres bloklarından kabul edilir (CGNAT 100.64.0.0/10)
+TAILSCALE_NETWORKS = (ipaddress.ip_network("100.64.0.0/10"),)
+
+# WSL çağrı öneki. Testlerde [] yapılır (doğrudan yerel bash).
+WSL_PREFIX = ["wsl", "--exec"]
+
+ALLOWED_FIELDS = ("password", "username", "notes")
+
+
+# --------------------------------------------------------------------------- #
+# Yapılandırma
+# --------------------------------------------------------------------------- #
 def get_macrodroid_webhook() -> str:
     url = os.environ.get("MACRODROID_WEBHOOK")
-    if not url or "YOUR_MACRODROID_DEVICE_ID" in url:
+    if not url:
         try:
             import winreg
             with winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Environment") as key:
                 url, _ = winreg.QueryValueEx(key, "MACRODROID_WEBHOOK")
         except Exception:
-            pass
-    return url or "https://trigger.macrodroid.com/YOUR_MACRODROID_DEVICE_ID/ajan_istek"
+            url = None
+    return url or WEBHOOK_PLACEHOLDER
 
-MACRODROID_WEBHOOK = get_macrodroid_webhook()
-FALLBACK_STATIC_TOKEN = os.environ.get(
-    "FALLBACK_STATIC_TOKEN", 
-    "ORNEK_YEDEK_TOKEN_12345"
-)
-OTP_VALIDITY_SECONDS = 30
-WATCHDOG_TIMEOUT_SECONDS = 30
 
-# Güvenli Süreç Beyaz Listesi (Whitelisted process isimleri)
-# Yerel onay ve kontrol isteklerinde güvenilen çağrıcı süreçler
-ALLOWED_PROCESS_NAMES = {
-    "python.exe", "python3.exe", "powershell.exe", "pwsh.exe", 
-    "cmd.exe", "wsl.exe", "bash.exe", "conhost.exe"
-}
+def load_allowed_items(raw: str | None = None) -> dict[str, tuple[str, str]]:
+    """
+    JIT_ALLOWED_ITEMS="OpenAI Key,Hetzner:notes,<uuid>" -> {anahtar: (bw_item, alan)}.
+    ':password|username|notes' eki istenen alanı seçer (varsayılan password).
+    Liste boşsa hiçbir sır istenemez (Fail-Secure). Mümkünse ad yerine item UUID'si kullanın.
+    """
+    if raw is None:
+        raw = os.environ.get("JIT_ALLOWED_ITEMS", "")
+    items: dict[str, tuple[str, str]] = {}
+    for part in raw.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        name, sep, field = part.rpartition(":")
+        if sep and field in ALLOWED_FIELDS and name:
+            items[part] = (name.strip(), field)
+        else:
+            items[part] = (part, "password")
+    return items
 
-class OTPManager:
-    """30 saniyelik tek kullanımlık dinamik OTP token yöneticisi (Context-Aware JIT)."""
-    def __init__(self, validity_seconds=30):
+
+def sanitize_note(note: str) -> str:
+    """Telefonda gösterilecek serbest metni kısaltır ve kontrol karakterlerinden arındırır."""
+    cleaned = re.sub(r"[\x00-\x1f\x7f]", " ", note or "").strip()
+    return cleaned[:MAX_NOTE_LENGTH]
+
+
+def strip_query(text: str) -> str:
+    """Log satırlarındaki ?query kısmını gizler (OTP / request id sızmasın)."""
+    return re.sub(r"\?\S*", "?…", text)
+
+
+# --------------------------------------------------------------------------- #
+# Onay yöneticisi
+# --------------------------------------------------------------------------- #
+class ApprovalManager:
+    """
+    Tek aktif onay isteğini ve sonucunu bellekte tutar.
+    - OTP telefona gider, request_id ajanda kalır; ikisi ayrı sırlardır.
+    - Aktif bir istek varken yenisi kabul edilmez (OTP ezme / bildirim spamı engeli).
+    - OTP tek kullanımlıktır: doğru ya da yanlış her denemede tüketilir.
+    - Sonuç (sır) tek sefer okunur ve RESULT_TTL_SECONDS sonra bellekten silinir.
+    """
+
+    def __init__(self, validity_seconds=OTP_VALIDITY_SECONDS,
+                 result_ttl_seconds=RESULT_TTL_SECONDS, clock=time.time):
         self.validity_seconds = validity_seconds
-        self.current_token = None
-        self.created_at = 0
-        self.current_context = {}
+        self.result_ttl_seconds = result_ttl_seconds
+        self._clock = clock
         self._lock = threading.Lock()
+        self._reqs: dict[str, dict] = {}
 
-    def generate_token(self, secret: str = "Genel Kasa", action: str = "Erişim", caller: str = "Bilinmeyen Süreç") -> str:
+    def _purge(self, now: float):
+        for rid in [rid for rid, r in self._reqs.items() if now > r["expires"]]:
+            r = self._reqs.pop(rid)
+            r["value"] = None
+
+    def _has_active(self) -> bool:
+        return any(r["state"] in ("waiting", "processing") for r in self._reqs.values())
+
+    def create(self, item_key: str, caller: str, note: str = "") -> dict | None:
+        """Yeni istek açar. Aktif istek varsa None döner."""
         with self._lock:
-            self.current_token = secrets.token_urlsafe(16)
-            self.created_at = time.time()
-            self.current_context = {
-                "secret": secret,
-                "action": action,
-                "caller": caller,
-                "created_at": self.created_at
+            now = self._clock()
+            self._purge(now)
+            if self._has_active():
+                return None
+            req_id = secrets.token_urlsafe(16)
+            otp = secrets.token_urlsafe(16)
+            self._reqs[req_id] = {
+                "state": "waiting", "otp": otp, "item": item_key, "caller": caller,
+                "note": note, "created_at": now, "expires": now + self.validity_seconds,
+                "value": None, "error": "",
             }
-            return self.current_token
+            return {"request_id": req_id, "otp": otp}
 
-    def verify_and_consume(self, token: str, is_remote: bool = False, dynamic_otp: str = "") -> tuple[bool, str, dict]:
+    def cancel(self, req_id: str):
         with self._lock:
-            if not self.current_token:
-                return False, "Aktif onay bekleyen bir token bulunmuyor.", {}
-            
-            elapsed = time.time() - self.created_at
-            if elapsed > self.validity_seconds:
-                self.current_token = None
-                self.current_context = {}
-                return False, f"Token zaman aşımına uğradı ({elapsed:.1f}s > {self.validity_seconds}s). İstek iptal edildi.", {}
-            
-            # Zamanlama saldırılarına (timing attack) karşı sabit zamanlı kıyaslama
-            is_valid_otp = hmac.compare_digest(token, self.current_token)
-            
-            # KRİTİK GÜVENLİK DÜZELTMESİ:
-            # Sabit yedek token tek başına ve güncel OTP olmadan ASLA onay veremez!
-            # Ancak ve ancak hem sabit token hem de o anki güncel dinamik OTP doğrulanırsa geçerlidir.
-            is_valid_fallback = False
-            if bool(is_remote and FALLBACK_STATIC_TOKEN):
-                is_fallback_match = hmac.compare_digest(token, FALLBACK_STATIC_TOKEN)
-                has_matching_otp = bool(dynamic_otp and hmac.compare_digest(dynamic_otp, self.current_token))
-                if is_fallback_match and has_matching_otp:
-                    is_valid_fallback = True
-            
-            is_valid = is_valid_otp or is_valid_fallback
-            approved_context = self.current_context.copy()
-            
-            # Tek kullanımlık prensibi: İster başarılı ister başarısız olsun oturum anında tüketilir
-            self.current_token = None
-            self.current_context = {}
-            
-            if is_valid:
-                source_type = "Dinamik OTP + Yedek Doğrulama" if is_valid_fallback else "Dinamik OTP"
-                return True, f"Token doğrulandı ({source_type}).", approved_context
-            return False, "Geçersiz güvenlik tokenı (Yetkisiz onay denemesi veya güncel dinamik OTP eksik).", {}
+            self._reqs.pop(req_id, None)
 
-    def get_remaining_seconds(self) -> float:
+    def approve(self, token: str) -> tuple[bool, str, dict]:
+        """OTP'yi doğrular ve tüketir. Başarılıysa isteği 'processing' durumuna alır."""
         with self._lock:
-            if not self.current_token:
-                return 0.0
-            remaining = self.validity_seconds - (time.time() - self.created_at)
-            return max(0.0, remaining)
+            now = self._clock()
+            self._purge(now)
+            waiting = [(rid, r) for rid, r in self._reqs.items() if r["state"] == "waiting"]
+            if not waiting:
+                return False, "Onay bekleyen aktif bir istek yok (süresi dolmuş olabilir).", {}
+            rid, r = waiting[0]
+            # bytes ile karşılaştır: ASCII olmayan girdi TypeError atmasın
+            valid = hmac.compare_digest(token.encode("utf-8"), r["otp"].encode("utf-8"))
+            r["otp"] = None  # tek kullanımlık: başarılı da başarısız da tüketilir
+            if not valid:
+                self._reqs.pop(rid, None)
+                return False, "Geçersiz onay kodu. İstek iptal edildi.", {}
+            r["state"] = "processing"
+            r["expires"] = now + 60  # kilit açma/okuma süresi için üst sınır
+            return True, "Onay doğrulandı.", {
+                "request_id": rid, "item": r["item"], "caller": r["caller"], "note": r["note"],
+            }
+
+    def complete(self, req_id: str, value: str | None = None, error: str = ""):
+        with self._lock:
+            r = self._reqs.get(req_id)
+            if not r:
+                return
+            r["expires"] = self._clock() + self.result_ttl_seconds
+            if error:
+                r["state"], r["error"], r["value"] = "failed", error, None
+            else:
+                r["state"], r["value"] = "ready", value
+
+    def fetch(self, req_id: str) -> tuple[str, str]:
+        """('waiting'|'ready'|'failed'|'gone', içerik). 'ready' ve 'failed' tek sefer döner."""
+        with self._lock:
+            self._purge(self._clock())
+            r = self._reqs.get(req_id)
+            if not r:
+                return "gone", ""
+            if r["state"] in ("waiting", "processing"):
+                return "waiting", ""
+            self._reqs.pop(req_id, None)
+            if r["state"] == "ready":
+                return "ready", r["value"] or ""
+            return "failed", r["error"]
+
+    def pending_info(self) -> dict:
+        """/status için: bekleyen isteğin OTP içermeyen özeti."""
+        with self._lock:
+            now = self._clock()
+            self._purge(now)
+            for r in self._reqs.values():
+                if r["state"] == "waiting":
+                    return {
+                        "item": r["item"], "caller": r["caller"],
+                        "remaining_seconds": round(max(0.0, r["expires"] - now), 1),
+                    }
+            return {}
 
 
-otp_manager = OTPManager(validity_seconds=OTP_VALIDITY_SECONDS)
+approvals = ApprovalManager()
 watchdog_timer: threading.Timer | None = None
 watchdog_lock = threading.Lock()
 
 
+# --------------------------------------------------------------------------- #
+# WSL / Bitwarden
+# --------------------------------------------------------------------------- #
+# Tek bir bash oturumu: unlock -> get -> lock. Kilit, EXIT/INT/TERM trap'iyle garanti edilir.
+# Sırlar komut satırında değil ortam değişkenlerinde (WSLENV köprüsü) taşınır.
+BW_FETCH_SCRIPT = r'''
+BW="${JIT_BW_BIN:-bw}"
+trap '"$BW" lock --nointeraction </dev/null >/dev/null 2>&1' EXIT INT TERM
+export BW_PASSWORD="$(printf %s "$JIT_PW_B64" | base64 -d)" || exit 10
+unset JIT_PW_B64
+S="$("$BW" unlock --passwordenv BW_PASSWORD --raw --nointeraction </dev/null 2>/dev/null)" || exit 11
+unset BW_PASSWORD
+[ -n "$S" ] || exit 12
+"$BW" get "$JIT_BW_FIELD" "$JIT_BW_ITEM" --session "$S" --raw --nointeraction </dev/null 2>/dev/null || exit 13
+'''
+
+BW_LOCK_SCRIPT = r'''
+BW="${JIT_BW_BIN:-bw}"
+"$BW" lock --nointeraction </dev/null >/dev/null 2>&1
+'''
+
+BW_EXIT_MESSAGES = {
+    10: "Master parola WSL'e aktarılamadı.",
+    11: "Bitwarden kilidi açılamadı (parola yanlış ya da bw giriş yapmamış).",
+    12: "Bitwarden boş oturum anahtarı döndürdü.",
+    13: "Kayıt okunamadı (ad/ID yanlış, birden fazla eşleşme ya da alan boş).",
+}
+
+
+def run_wsl_script(script: str, env_extra: dict[str, str] | None = None, timeout: int = 20):
+    """
+    Betiği WSL içinde `bash -s` ile çalıştırır: betik stdin'den gider (komut satırında tırnak
+    sorunu yok, `ps` ile görünmez), sırlar WSLENV köprüsüyle ortam değişkeni olarak taşınır.
+    """
+    env_extra = dict(env_extra or {})
+    env = os.environ.copy()
+    env.update(env_extra)
+    names = list(env_extra)
+    if "JIT_BW_BIN" in env:
+        names.append("JIT_BW_BIN")
+    env["WSLENV"] = ":".join(f"{n}/u" for n in names)
+    return subprocess.run(
+        WSL_PREFIX + ["bash", "-s"], env=env, input=script, capture_output=True, text=True,
+        encoding="utf-8", errors="replace", timeout=timeout,
+    )
+
+
 def execute_bw_lock() -> bool:
-    """Acil durum kilit emri: WSL ortamında Bitwarden kasasını zorla kilitler."""
+    """Acil durum kilit emri: Bitwarden kasasını WSL içinde kilitler."""
     try:
-        # --nointeraction parametresi interaktif tty/stdin beklemelerini %100 önler
-        cmd = ["wsl", "bash", "-c", "bw lock --nointeraction >/dev/null 2>&1"]
-        res = subprocess.run(cmd, timeout=30, stdin=subprocess.DEVNULL)
+        res = run_wsl_script(BW_LOCK_SCRIPT, timeout=20)
         if res.returncode == 0:
-            print("\n[WATCHDOG / TRAP] Bitwarden kasası güvenlik protokolü gereği kilitlendi (bw lock).")
+            print("[LOCK] Bitwarden kasası kilitlendi.")
             return True
-        else:
-            # Fallback olarak doğrudan wsl komutu
-            fallback_cmd = ["wsl", "bw", "lock", "--nointeraction"]
-            res_fb = subprocess.run(fallback_cmd, timeout=30, stdin=subprocess.DEVNULL)
-            if res_fb.returncode == 0:
-                print("\n[WATCHDOG / TRAP] Bitwarden kasası güvenlik protokolü gereği kilitlendi (bw lock fallback).")
-                return True
-            print(f"\n[KRITIK ALARM] bw lock basarisiz! Returncode: {res.returncode}")
-            return False
+        print(f"[KRITIK ALARM] bw lock başarısız! Returncode: {res.returncode}")
+        return False
     except Exception as e:
-        print(f"\n[KRITIK ALARM] bw lock çağrısı sırasında istisna: {e}")
+        print(f"[KRITIK ALARM] bw lock çağrısı sırasında istisna: {type(e).__name__}")
         return False
 
 
 def arm_watchdog(timeout_seconds=WATCHDOG_TIMEOUT_SECONDS):
-    """Kasa açıldığı anda 30 saniyelik zorunlu geri sayım başlatır."""
+    """Son çare: işlem takılırsa belirtilen sürede kasayı zorla kilitler."""
     global watchdog_timer
     with watchdog_lock:
         if watchdog_timer and watchdog_timer.is_alive():
@@ -161,309 +302,310 @@ def arm_watchdog(timeout_seconds=WATCHDOG_TIMEOUT_SECONDS):
         watchdog_timer = threading.Timer(timeout_seconds, execute_bw_lock)
         watchdog_timer.daemon = True
         watchdog_timer.start()
-        print(f"[WATCHDOG] {timeout_seconds} saniyelik zorunlu kilit zamanlayıcısı kuruldu.")
 
 
 def disarm_watchdog():
-    """İşlem bittiğinde zamanlayıcıyı devre dışı bırakır."""
     global watchdog_timer
     with watchdog_lock:
         if watchdog_timer and watchdog_timer.is_alive():
             watchdog_timer.cancel()
-            watchdog_timer = None
+        watchdog_timer = None
 
 
-def inspect_caller_process(client_ip: str, client_port: int, request_path: str = "") -> tuple[bool, str]:
+# DPAPI parolasını çözer ve BASE64(UTF-8) olarak yazar: konsol kod sayfası (örn. cp1254)
+# yüzünden ş/ğ/ı gibi karakterlerin bozulmasını önler.
+PS_DECRYPT_SCRIPT = r'''
+$p = $env:JIT_DPAPI_FILE
+if (-not $p) { $p = Join-Path $env:USERPROFILE ".bw_master_dpapi.txt" }
+if (-not (Test-Path $p)) { [Console]::Error.Write("dpapi dosyasi yok"); exit 2 }
+$secure = (Get-Content -Raw $p).Trim() | ConvertTo-SecureString
+$bstr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($secure)
+try {
+    $plain = [Runtime.InteropServices.Marshal]::PtrToStringBSTR($bstr)
+    [Console]::Out.Write([Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($plain)))
+} finally {
+    [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr)
+}
+'''
+
+
+def fetch_secret_from_vault(item: str, field: str) -> tuple[bool, str]:
     """
-    İstek gönderen yerel sürecin PID ve adını tespit ederek doğrular (Fail-Secure).
-    Ağ üzerinden (Tailscale/LAN) gelen bağlantılarda yalnızca /approve rotasına izin verilir.
-    """
-    # Uzak istemciler için kontrol: Yalnızca /approve onay rotasına izin verilir
-    if client_ip not in ("127.0.0.1", "::1", "localhost"):
-        if request_path == "/approve":
-            return True, f"Uzak İstemci IP (Onay Rotası): {client_ip}"
-        return False, f"Güvenlik Reddi: Uzak IP'den idari rotalara ({request_path}) erişim engellendi."
-
-    # Yerel çağrıcı kontrolü (Fail-Secure)
-    if not psutil:
-        return False, "Güvenlik Reddi: psutil modülü bulunamadı (Fail-Secure)"
-
-    try:
-        for conn in psutil.net_connections(kind="inet"):
-            # Gelen isteğin kaynak portu ile eşleştir
-            if conn.laddr and conn.laddr.port == client_port:
-                pid = conn.pid
-                if pid:
-                    proc = psutil.Process(pid)
-                    proc_name = proc.name().lower()
-                    if proc_name in ALLOWED_PROCESS_NAMES:
-                        return True, f"Doğrulanan Yerel Süreç: {proc_name} (PID: {pid})"
-                    else:
-                        return False, f"Yetkisiz Süreç Reddedildi: {proc_name} (PID: {pid})"
-        # Eşleşen port bulunamadıysa Fail-Secure
-        return False, "Güvenlik Reddi: Geçersiz/Bilinmeyen yerel süreç (Fail-Secure)"
-    except Exception as e:
-        # İnceleme sırasında hata oluşursa Fail-Secure
-        return False, "Güvenlik Reddi: Geçersiz/Bilinmeyen yerel süreç (Fail-Secure)"
-
-
-def unlock_bitwarden_in_memory() -> tuple[bool, str]:
-    """
-    Pure In-Memory & Zero-File Kilit Açma:
-    1. DPAPI master parolasını Windows belleğinde EncodedCommand ile hatasız çözer.
-    2. Microsoft WSLENV resmi değişken köprüsü ile 'bw unlock --passwordenv' çağırır.
-    3. Session anahtarı alındığı an trap protokolüyle kasayı otomatik kilitler.
-    4. /dev/shm veya diskte hiçbir geçici dosya KULLANILMAZ.
+    DPAPI -> WSL(bw unlock -> bw get -> bw lock) zincirini çalıştırır, sırrı döndürür.
+    Session key WSL dışına çıkmaz. Kasa kilitlenemezse sır atılır (Fail-Secure).
     """
     arm_watchdog(WATCHDOG_TIMEOUT_SECONDS)
-
-    ps_code = """
-$dpapiPath = "$env:USERPROFILE\\.gemini\\bw_master_dpapi.txt"
-if (-not (Test-Path $dpapiPath)) { $dpapiPath = "$env:USERPROFILE\\.bw_master_dpapi.txt" }
-$securePw = Get-Content $dpapiPath | ConvertTo-SecureString
-$BSTR = [System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($securePw)
-$plain = [System.Runtime.InteropServices.Marshal]::PtrToStringAuto($BSTR)
-[System.Runtime.InteropServices.Marshal]::ZeroFreeBSTR($BSTR)
-[Console]::Out.Write($plain)
-"""
     try:
-        # 1. Adım: Base64 EncodedCommand ile sıfır kaçış hatası garantisi
-        encoded_cmd = base64.b64encode(ps_code.encode('utf-16le')).decode('ascii')
-        ps_proc = subprocess.run(
-            ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-EncodedCommand", encoded_cmd],
-            capture_output=True,
-            text=True,
-            timeout=10
+        encoded = base64.b64encode(PS_DECRYPT_SCRIPT.encode("utf-16le")).decode("ascii")
+        ps = subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-EncodedCommand", encoded],
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            timeout=10, stdin=subprocess.DEVNULL,
         )
-        if ps_proc.returncode != 0 or not ps_proc.stdout:
-            return False, f"DPAPI çözme hatası: {ps_proc.stderr.strip()}"
+        pw_b64 = ps.stdout.strip()
+        if ps.returncode != 0 or not pw_b64:
+            return False, "DPAPI parolası çözülemedi."
 
-        plain_pw = ps_proc.stdout
-
-        # 2. Adım: Microsoft WSLENV köprüsü ile şifreyi çevre değişkeni olarak güvenle aktar
-        wsl_env = os.environ.copy()
-        wsl_env["BW_PASSWORD"] = plain_pw
-        wsl_env["WSLENV"] = "BW_PASSWORD/u"
-
-        wsl_proc = subprocess.run(
-            ["wsl", "bw", "unlock", "--passwordenv", "BW_PASSWORD", "--raw"],
-            env=wsl_env,
-            capture_output=True,
-            text=True,
-            timeout=12
+        res = run_wsl_script(
+            BW_FETCH_SCRIPT,
+            {"JIT_PW_B64": pw_b64, "JIT_BW_ITEM": item, "JIT_BW_FIELD": field},
+            timeout=20,
         )
+        del pw_b64  # Not: Python str'i bellekten güvenle silmek mümkün değil, referans bırakılır.
 
-        # Şifreyi ve ortam değişkenini bellekten anında imha et
-        del wsl_env["BW_PASSWORD"]
-        del plain_pw
+        value = res.stdout
+        if value.endswith("\n"):
+            value = value[:-1]
 
-        session_key = wsl_proc.stdout.strip()
-        error_output = wsl_proc.stderr.strip()
+        # Kemer + pantolon: trap zaten kilitledi, yine de doğrula.
+        if not execute_bw_lock():
+            value = ""
+            return False, "GÜVENLİK ALARMI: Kasa kilitlenemedi, sır atıldı."
 
-        # 3. Adım: Kasa kilitleme (Zorunlu Trap Lock)
-        lock_ok = execute_bw_lock()
-        if not lock_ok:
-            if 'session_key' in locals():
-                del session_key
-            print("\n[KRİTİK GÜVENLİK ALARMI] Bitwarden kasası kilitlenemedi! Fail-Secure gereği oturum anahtarı imha edildi.")
-            return False, "[GÜVENLİK ALARMI] Kasa kilitleme başarısız oldu (bw lock hatası). Kasa açık kalma riski nedeniyle işlem iptal edildi ve anahtar imha edildi."
-
-        if wsl_proc.returncode == 0 and len(session_key) > 10:
-            return True, f"[BASARILI] Session anahtari uretildi ({session_key[:4]}****) ve kasa trap ile kilitlendi."
-        else:
-            return False, f"Bitwarden unlock hatası: {error_output or session_key}"
+        if res.returncode != 0:
+            return False, BW_EXIT_MESSAGES.get(res.returncode, f"Bitwarden hatası (kod {res.returncode}).")
+        if not value:
+            return False, "Kayıt boş döndü."
+        return True, value
     except subprocess.TimeoutExpired:
         execute_bw_lock()
-        return False, "Kilit açma işlemi zaman aşımına uğradı (Timeout)."
+        return False, "Kilit açma/okuma zaman aşımına uğradı."
     except Exception as e:
         execute_bw_lock()
-        return False, f"Kilit açma istisnası: {str(e)}"
+        return False, f"İstisna: {type(e).__name__}"
     finally:
-        # İşlem bittiğinde watchdog'ı sıfırla
         disarm_watchdog()
 
 
-def trigger_mobile_approval(secret: str = "Genel Kasa", action: str = "Kasa Kilidi Açma", caller: str = "Ajan"):
-    """Yeni bir 30s OTP üretir ve bağlam bilgileriyle MacroDroid mobil webhook'una istek atar."""
-    token = otp_manager.generate_token(secret=secret, action=action, caller=caller)
-    print(f"\n[JIT] Yeni 30s dinamik OTP oluşturuldu: {token[:4]}**** (Geçerlilik: {OTP_VALIDITY_SECONDS}s)")
-    print(f"[JIT] Onay Bağlamı: Sır='{secret}' | İşlem='{action}' | Talep Eden='{caller}'")
-    
-    encoded_token = urllib.parse.quote(token)
-    encoded_secret = urllib.parse.quote(secret)
-    encoded_action = urllib.parse.quote(action)
-    encoded_caller = urllib.parse.quote(caller)
-    webhook_url = (
-        f"{MACRODROID_WEBHOOK}?otp={encoded_token}&validity={OTP_VALIDITY_SECONDS}"
-        f"&secret={encoded_secret}&action={encoded_action}&caller={encoded_caller}"
-    )
-    
-    print("[JIT] MacroDroid telefon onay isteği bağlam bilgileriyle iletiliyor...")
+# --------------------------------------------------------------------------- #
+# Çağıran denetimi
+# --------------------------------------------------------------------------- #
+def _normalize_ip(ip: str):
+    addr = ipaddress.ip_address(ip.split("%")[0])
+    if getattr(addr, "ipv4_mapped", None):
+        addr = addr.ipv4_mapped
+    return addr
+
+
+def is_loopback(ip: str) -> bool:
     try:
-        req = urllib.request.Request(
-            webhook_url,
-            headers={"User-Agent": "ZeroTrust-JIT-Daemon/2.1"}
-        )
+        return _normalize_ip(ip).is_loopback
+    except ValueError:
+        return False
+
+
+def is_tailscale_ip(ip: str) -> bool:
+    try:
+        addr = _normalize_ip(ip)
+    except ValueError:
+        return False
+    return any(addr in net for net in TAILSCALE_NETWORKS if addr.version == net.version)
+
+
+def inspect_caller_process(client_ip: str, client_port: int, request_path: str = "") -> tuple[bool, str, str]:
+    """
+    (izinli mi, mesaj, süreç adı) döndürür. Her durumda Fail-Secure.
+    - Uzak istemci: yalnızca Tailscale adreslerinden ve yalnızca /approve.
+    - Yerel istemci: bağlantıyı açan sürecin adı ALLOWED_PROCESS_NAMES içinde olmalı.
+    """
+    if not is_loopback(client_ip):
+        if request_path == "/approve" and is_tailscale_ip(client_ip):
+            return True, f"Tailscale istemcisi: {client_ip}", "remote"
+        return False, f"Reddedildi: {client_ip} adresinden {request_path or '/'} erişimine izin yok.", ""
+
+    if not psutil:
+        return False, "Reddedildi: psutil yok (Fail-Secure).", ""
+    try:
+        for conn in psutil.net_connections(kind="inet"):
+            if (conn.laddr and conn.laddr.port == client_port
+                    and conn.raddr and conn.raddr.port == PORT and conn.pid):
+                name = psutil.Process(conn.pid).name().lower()
+                if name in ALLOWED_PROCESS_NAMES:
+                    return True, f"Yerel süreç: {name} (PID {conn.pid})", name
+                return False, f"Yetkisiz süreç reddedildi: {name} (PID {conn.pid})", name
+        return False, "Reddedildi: çağıran süreç bulunamadı (Fail-Secure).", ""
+    except Exception:
+        return False, "Reddedildi: süreç denetimi başarısız (Fail-Secure).", ""
+
+
+# --------------------------------------------------------------------------- #
+# Telefon bildirimi
+# --------------------------------------------------------------------------- #
+def send_mobile_approval(otp: str, item: str, caller: str, note: str) -> bool:
+    """OTP'yi ve bağlamı MacroDroid webhook'una yollar. (OTP üçüncü taraf sunucudan geçer!)"""
+    url = get_macrodroid_webhook()
+    if url == WEBHOOK_PLACEHOLDER or not url.startswith("https://"):
+        print("[UYARI] MACRODROID_WEBHOOK ayarlı değil ya da https değil.")
+        return False
+    query = urllib.parse.urlencode({
+        "otp": otp, "validity": OTP_VALIDITY_SECONDS, "item": item, "caller": caller, "note": note,
+    })
+    try:
+        req = urllib.request.Request(f"{url}?{query}", headers={"User-Agent": f"ZeroTrust-JIT-Daemon/{VERSION}"})
         with urllib.request.urlopen(req, timeout=5) as response:
-            status = response.getcode()
-            print(f"[JIT] Mobil webhook başarılı iletildi (HTTP {status}). Onay bekleniyor...")
-            return True, token
+            print(f"[JIT] Telefon bildirimi iletildi (HTTP {response.getcode()}).")
+            return True
     except Exception as e:
-        print(f"[UYARI] Mobil webhook gönderilemedi (Yerel test modunda devam edilebilir): {e}")
-        return False, token
+        print(f"[UYARI] Telefon bildirimi gönderilemedi: {type(e).__name__}")
+        return False
 
 
+# --------------------------------------------------------------------------- #
+# HTTP
+# --------------------------------------------------------------------------- #
 class HardenedHTTPServer(ThreadingHTTPServer):
-    """DoS ve Slowloris saldırılarına karşı soket zaman aşımı korumalı HTTP sunucusu."""
+    """Slowloris'e karşı soket zaman aşımı korumalı sunucu."""
     daemon_threads = True
 
     def get_request(self):
         sock, addr = super().get_request()
-        sock.settimeout(10.0)  # 10s Slowloris / Connection timeout
+        sock.settimeout(10.0)
         return sock, addr
 
 
 class JITServerHandler(BaseHTTPRequestHandler):
-    """HTTP İstek İşleyicisi - Kalıcı Sıfır Güven Servisi"""
+    server_version = "ZeroTrustJIT"
+    sys_version = ""
 
     def log_message(self, format, *args):
-        # Varsayılan terminal log kirliliğini engelle, özel formatla yaz
-        sys.stdout.write(f"[HTTP] {self.address_string()} - {format % args}\n")
+        sys.stdout.write(f"[HTTP] {self.address_string()} - {strip_query(format % args)}\n")
 
+    # -- yardımcılar -- #
+    def _send(self, code: int, body: str, ctype: str = "text/plain; charset=utf-8"):
+        data = body.encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(data)
+
+    def _json(self, code: int, obj: dict):
+        self._send(code, json.dumps(obj, ensure_ascii=False) + "\n", "application/json; charset=utf-8")
+
+    # -- rotalar -- #
     def do_GET(self):
         parsed = urlparse(self.path)
-        client_ip = self.client_address[0]
-        client_port = self.client_address[1]
+        client_ip, client_port = self.client_address[0], self.client_address[1]
 
-        # 1. İstek atan sürecin doğrulanması (Process Whitelist / PID kontrolü - Fail-Secure)
-        caller_ok, caller_msg = inspect_caller_process(client_ip, client_port, parsed.path)
-        if not caller_ok:
-            self.send_response(403)
-            self.send_header('Content-Type', 'text/plain; charset=utf-8')
-            self.end_headers()
-            self.wfile.write(f"403 Forbidden: {caller_msg}".encode('utf-8'))
-            print(f"[GÜVENLİK ENGELİ] {caller_msg}")
+        ok, msg, proc_name = inspect_caller_process(client_ip, client_port, parsed.path)
+        if not ok:
+            print(f"[GÜVENLİK ENGELİ] {msg}")
+            self._send(403, f"403 Forbidden: {msg}")
             return
 
-        # 2. Rota: /approve (Mobil veya yetkili onay mekanizması)
-        if parsed.path == '/approve':
-            query = parse_qs(parsed.query)
-            token = query.get('token', [''])[0] or query.get('otp', [''])[0]
-            dynamic_otp = query.get('dynamic_otp', [''])[0] or query.get('current_otp', [''])[0]
-            is_remote = client_ip not in ("127.0.0.1", "::1", "localhost")
-
-            is_valid, reason, context = otp_manager.verify_and_consume(token, is_remote=is_remote, dynamic_otp=dynamic_otp)
-            if not is_valid:
-                self.send_response(403)
-                self.send_header('Content-Type', 'text/plain; charset=utf-8')
-                self.end_headers()
-                self.wfile.write(f"HATA: {reason}\n".encode('utf-8'))
-                print(f"\n[GÜVENLİK UYARISI] Sahte/Süresi Dolmuş Onay Girişimi: {reason} (IP: {client_ip})")
-                return
-
-            secret_info = context.get('secret', 'Genel Kasa')
-            action_info = context.get('action', 'Kasa Kilidi Açma')
-            caller_info = context.get('caller', 'Ajan')
-            print(f"\n[JIT] Mobil onay doğrulandı! Sır: '{secret_info}' | İşlem: '{action_info}' | Talep Eden: '{caller_info}'")
-            print(f"[JIT] Bitwarden kilidi bellek içi açılıyor...")
-            success, msg = unlock_bitwarden_in_memory()
-
-            if success:
-                self.send_response(200)
-                self.send_header('Content-Type', 'text/plain; charset=utf-8')
-                self.end_headers()
-                success_resp = (
-                    f"Onay Basarili!\n"
-                    f"Onaylanan Sir: {secret_info}\n"
-                    f"Onaylanan Islem: {action_info}\n"
-                    f"Durum: Bitwarden kasasi bellek ici acildi ve trap ile mühürlendi.\n"
-                )
-                self.wfile.write(success_resp.encode('utf-8'))
-                print(f"[JIT] İşlem başarıyla tamamlandı: {msg}")
-            else:
-                self.send_response(500)
-                self.send_header('Content-Type', 'text/plain; charset=utf-8')
-                self.end_headers()
-                self.wfile.write(f"Kasa Acma Hatasi: {msg}\n".encode('utf-8'))
-                print(f"[JIT HATA] Kilit açılamadı: {msg}")
-
-        # 3. Rota: /request_approval (Ajan veya sistem yeni bir onay döngüsü talep edebilir)
-        elif parsed.path == '/request_approval':
-            query = parse_qs(parsed.query)
-            secret = query.get('secret', ['Genel Kasa'])[0]
-            action = query.get('action', ['Kasa Kilidi Açma'])[0]
-            caller = query.get('caller', ['Ajan'])[0]
-
-            sent, current_otp = trigger_mobile_approval(secret=secret, action=action, caller=caller)
-            self.send_response(200)
-            self.send_header('Content-Type', 'application/json; charset=utf-8')
-            self.end_headers()
-            import json
-            res_obj = {
-                "status": "waiting_approval",
-                "secret": secret,
-                "action": action,
-                "caller": caller,
-                "validity_seconds": OTP_VALIDITY_SECONDS,
-                "webhook_sent": bool(sent)
-            }
-            self.wfile.write((json.dumps(res_obj, ensure_ascii=False) + "\n").encode('utf-8'))
-
-        # 4. Rota: /status (Canlılık ve sağlık kontrolü)
-        elif parsed.path == '/status':
-            remaining = otp_manager.get_remaining_seconds()
-            ctx = otp_manager.current_context if remaining > 0 else {}
-            self.send_response(200)
-            self.send_header('Content-Type', 'application/json; charset=utf-8')
-            self.end_headers()
-            import json
-            status_obj = {
-                "service": "ZeroTrust-JIT-Daemon",
-                "version": "2.1",
-                "otp_pending": bool(remaining > 0),
-                "otp_remaining_seconds": round(remaining, 1),
-                "pending_context": ctx
-            }
-            self.wfile.write((json.dumps(status_obj, ensure_ascii=False) + "\n").encode('utf-8'))
-
-        # 5. Rota: /lock (Manuel acil kilit emri)
-        elif parsed.path == '/lock':
-            execute_bw_lock()
-            self.send_response(200)
-            self.send_header('Content-Type', 'text/plain; charset=utf-8')
-            self.end_headers()
-            self.wfile.write(b"Acil Kilit Emri Uygulandi (bw lock).\n")
-
+        query = parse_qs(parsed.query)
+        route = parsed.path
+        if route == "/approve":
+            self._route_approve(query, client_ip)
+        elif route == "/request_approval":
+            self._route_request_approval(query, proc_name)
+        elif route == "/fetch":
+            self._route_fetch(query)
+        elif route == "/status":
+            self._json(200, {"service": "ZeroTrust-JIT-Daemon", "version": VERSION,
+                             "pending": approvals.pending_info()})
+        elif route == "/lock":
+            ok_lock = execute_bw_lock()
+            self._send(200 if ok_lock else 500, "Kasa kilitlendi.\n" if ok_lock else "Kilitleme başarısız!\n")
         else:
-            self.send_response(404)
-            self.send_header('Content-Type', 'text/plain; charset=utf-8')
-            self.end_headers()
-            self.wfile.write(b"404 Not Found\n")
+            self._send(404, "404 Not Found\n")
+
+    def _route_request_approval(self, query, proc_name: str):
+        allowed = load_allowed_items()
+        if not allowed:
+            self._send(503, "JIT_ALLOWED_ITEMS boş: hiçbir sır istenemez.\n")
+            return
+        item_key = query.get("item", [""])[0]
+        if item_key not in allowed:
+            self._send(403, "Bu kayıt izinli listede değil.\n")
+            return
+        note = sanitize_note(query.get("note", [""])[0])
+
+        created = approvals.create(item_key, caller=proc_name or "bilinmiyor", note=note)
+        if created is None:
+            self._send(429, "Zaten bekleyen bir onay isteği var. Süresinin dolmasını bekleyin.\n")
+            return
+        sent = send_mobile_approval(created["otp"], item_key, proc_name or "bilinmiyor", note)
+        if not sent:
+            approvals.cancel(created["request_id"])  # kimse onaylayamayacak, slotu boşalt
+            self._send(502, "Telefon bildirimi gönderilemedi; istek iptal edildi.\n")
+            return
+        print(f"[JIT] Onay isteği: kayıt='{item_key}' çağıran='{proc_name}'")
+        self._json(200, {"status": "waiting_approval", "request_id": created["request_id"],
+                         "item": item_key, "validity_seconds": OTP_VALIDITY_SECONDS})
+
+    def _route_approve(self, query, client_ip: str):
+        token = query.get("token", [""])[0] or query.get("otp", [""])[0]
+        valid, reason, ctx = approvals.approve(token)
+        if not valid:
+            print(f"[GÜVENLİK UYARISI] Onay reddedildi: {reason} (IP: {client_ip})")
+            self._send(403, f"HATA: {reason}\n")
+            return
+
+        allowed = load_allowed_items()
+        item_key = ctx["item"]
+        if item_key not in allowed:  # liste çalışırken değiştiyse
+            approvals.complete(ctx["request_id"], error="Kayıt artık izinli listede değil.")
+            self._send(403, "Kayıt izinli listede değil.\n")
+            return
+
+        bw_item, field = allowed[item_key]
+        print(f"[JIT] Onaylandı: kayıt='{item_key}' çağıran='{ctx['caller']}'. Kasa açılıyor...")
+        success, result = fetch_secret_from_vault(bw_item, field)
+        if success:
+            approvals.complete(ctx["request_id"], value=result)
+            self._send(200, f"Onaylandı: {item_key}. Ajan sırrı {RESULT_TTL_SECONDS} sn içinde alabilir.\n")
+        else:
+            approvals.complete(ctx["request_id"], error=result)
+            print(f"[JIT HATA] {result}")
+            self._send(500, f"Hata: {result}\n")
+
+    def _route_fetch(self, query):
+        req_id = query.get("id", [""])[0]
+        state, payload = approvals.fetch(req_id)
+        if state == "ready":
+            self._send(200, payload)
+        elif state == "waiting":
+            self._json(202, {"status": "waiting"})
+        elif state == "failed":
+            self._json(502, {"status": "failed", "error": payload})
+        else:
+            self._json(404, {"status": "gone"})
+
+
+def make_servers(addrs=None, port=None) -> list[HardenedHTTPServer]:
+    return [HardenedHTTPServer((a, port if port is not None else PORT), JITServerHandler)
+            for a in (addrs or BIND_ADDRS)]
 
 
 def run_daemon():
-    """Kalıcı arka plan HTTP dinleyici servisini başlatır (os._exit içermez)."""
-    server_address = ('0.0.0.0', PORT)
-    httpd = HardenedHTTPServer(server_address, JITServerHandler)
+    servers = make_servers()
     print("=" * 65)
-    print(f"  Zero-Trust JIT Bitwarden Daemon V3.0 Aktif")
-    print(f"  Dinleme Portu        : {PORT}")
-    print(f"  OTP Geçerlilik Süresi: {OTP_VALIDITY_SECONDS} Saniye")
-    print(f"  Watchdog Zaman Aşımı : {WATCHDOG_TIMEOUT_SECONDS} Saniye (Zorunlu Trap Lock)")
-    print(f"  Mimari               : Pure In-Memory, Zero-File, Process Whitelist")
+    print(f"  Zero-Trust JIT Bitwarden Daemon V{VERSION}")
+    print(f"  Dinleme            : {', '.join(f'{a}:{PORT}' for a in BIND_ADDRS)}")
+    print(f"  İzinli kayıt sayısı: {len(load_allowed_items())}")
+    print(f"  OTP / Sonuç süresi : {OTP_VALIDITY_SECONDS}s / {RESULT_TTL_SECONDS}s")
     print("=" * 65)
+    if any(a in ("0.0.0.0", "::") for a in BIND_ADDRS):
+        print("[UYARI] 0.0.0.0'a bağlısınız: servis tüm ağa açık. Tailscale IP'sine bağlamanız önerilir.")
+    if not load_allowed_items():
+        print("[UYARI] JIT_ALLOWED_ITEMS boş: hiçbir sır istenemez.")
 
+    threads = [threading.Thread(target=s.serve_forever, daemon=True) for s in servers]
+    for t in threads:
+        t.start()
     try:
-        httpd.serve_forever()
+        while True:
+            time.sleep(3600)
     except KeyboardInterrupt:
-        print("\n[JIT] Kullanıcı kesmesi (SIGINT) yakalandı. Kasa kilitleniyor...")
+        print("\n[JIT] Kesme alındı. Kasa kilitleniyor...")
         execute_bw_lock()
-        httpd.server_close()
-        print("[JIT] Sunucu güvenli biçimde durduruldu.")
+        for s in servers:
+            s.shutdown()
+            s.server_close()
+        print("[JIT] Sunucu durduruldu.")
 
 
-if __name__ == '__main__':
-    # İsteğe bağlı olarak başlatılırken onay talebi gönderilebilir
-    if "--request" in sys.argv:
-        trigger_mobile_approval()
+if __name__ == "__main__":
     run_daemon()
